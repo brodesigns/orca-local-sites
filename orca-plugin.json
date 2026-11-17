@@ -1,0 +1,63 @@
+{
+  "manifestVersion": 2,
+  "id": "local-sites",
+  "name": "Local Sites",
+  "version": "0.1.0",
+  "description": "One-click local preview for your web projects: detects Next.js, Vite, Astro, Nuxt, SvelteKit, PHP, static sites and WordPress plugins, starts them in a visible Orca terminal, shows logs and errors, and opens the site in your default browser.",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "local-sites",
+        "title": "Local Sites",
+        "icon": "globe",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "refresh",
+        "title": "Local Sites: Rescan projects"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "workspace:write"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "terminal:read"
+    },
+    {
+      "kind": "storage:own"
+    }
+  ],
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "The Local Sites panel in Orca's sidebar: three web projects with status, start and stop buttons, an Open in browser button and an errors list"
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot-overview.png",
+      "alt": "Three projects in the panel: one running with a compile error, one stopped, one failed with a port conflict",
+      "caption": "Start, stop and see errors at a glance"
+    },
+    {
+      "path": "assets/screenshot-access.png",
+      "alt": "Four checkmarks: reads workspaces and terminal output, runs one command in its own terminal, opens only localhost after a click, no requests of its own",
+      "caption": "Why Full access? Local only, no tracking"
+    }
+  ]
+}
