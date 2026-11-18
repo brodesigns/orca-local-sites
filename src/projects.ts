@@ -58,6 +58,8 @@ export type ProjectInfo = {
   docroot: 'public' | '.'
   /** WordPress: plugins from wordpress.org the project needs (e.g. woocommerce) */
   plugins: string[]
+  /** Node projects: there is no node_modules folder yet, so the start installs first */
+  needsInstall: boolean
 }
 
 /** Pinned on purpose: the plugin runs this package via npx in your terminal */
@@ -76,20 +78,20 @@ async function exists(path: string): Promise<boolean> {
 export async function detectProject(dir: string): Promise<ProjectInfo | null> {
   const wp = await detectWordPress(dir)
   if (wp) {
-    return { kind: 'wordpress', manager: null, framework: 'wordpress', label: 'WordPress', script: null, port: null, docroot: '.', plugins: wp }
+    return { kind: 'wordpress', manager: null, framework: 'wordpress', label: 'WordPress', script: null, port: null, docroot: '.', plugins: wp, needsInstall: false }
   }
   const node = await detectNode(dir)
   if (node) return node
   if (await exists(join(dir, 'public', 'index.php'))) return php('public')
   if (await exists(join(dir, 'index.php'))) return php('.')
   if (await exists(join(dir, 'index.html'))) {
-    return { kind: 'static', manager: null, framework: 'static', label: 'Static site', script: null, port: null, docroot: '.', plugins: [] }
+    return { kind: 'static', manager: null, framework: 'static', label: 'Static site', script: null, port: null, docroot: '.', plugins: [], needsInstall: false }
   }
   return null
 }
 
 function php(docroot: 'public' | '.'): ProjectInfo {
-  return { kind: 'php', manager: null, framework: 'php', label: 'PHP', script: null, port: null, docroot, plugins: [] }
+  return { kind: 'php', manager: null, framework: 'php', label: 'PHP', script: null, port: null, docroot, plugins: [], needsInstall: false }
 }
 
 const HEADER_BYTES = 8192
@@ -144,10 +146,15 @@ async function detectNode(dir: string): Promise<ProjectInfo | null> {
     if (!fw) return null
     const script = SCRIPTS.find((n) => typeof p.scripts?.[n] === 'string')
     if (!script) return null
-    return { kind: 'node', manager: await detectManager(dir), framework: fw.id, label: fw.label, script, port: fw.port, docroot: '.', plugins: [] }
+    return { kind: 'node', manager: await detectManager(dir), framework: fw.id, label: fw.label, script, port: fw.port, docroot: '.', plugins: [], needsInstall: !(await installed(dir)) }
   } catch {
     return null
   }
+}
+
+/** Dependencies are there: node_modules, or Yarn Plug'n'Play which never has that folder */
+async function installed(dir: string): Promise<boolean> {
+  return (await exists(join(dir, 'node_modules'))) || (await exists(join(dir, '.pnp.cjs'))) || (await exists(join(dir, '.pnp.js')))
 }
 
 async function detectManager(dir: string): Promise<PackageManager> {
@@ -179,6 +186,8 @@ export function blueprintFor(plugins: string[]): string {
   return JSON.stringify({ steps })
 }
 
+const INSTALL: Record<PackageManager, string> = { pnpm: 'pnpm install', npm: 'npm install', yarn: 'yarn install', bun: 'bun install' }
+
 /** Shell command for the terminal. Only fixed strings and a checked integer go in. */
 export function devCommand(info: ProjectInfo, port: number, wp?: WordPressRun): string {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid port')
@@ -199,10 +208,11 @@ export function devCommand(info: ProjectInfo, port: number, wp?: WordPressRun): 
       if (!info.manager || !info.script || !info.port) throw new Error('Incomplete project')
       if (!SCRIPTS.includes(info.script)) throw new Error('Invalid script')
       const run = runScript(info.manager, info.script)
-      if (info.port === 'env') return `PORT=${port} ${run}`
       // npm and bun need "--" to pass flags on to the script
       const sep = info.manager === 'npm' ? ' --' : ''
-      return `${run}${sep} ${info.port} ${port}`
+      const dev = info.port === 'env' ? `PORT=${port} ${run}` : `${run}${sep} ${info.port} ${port}`
+      // A fresh worktree has no node_modules: install first, the dev server only starts if that worked
+      return info.needsInstall ? `${INSTALL[info.manager]} && ${dev}` : dev
     }
   }
 }

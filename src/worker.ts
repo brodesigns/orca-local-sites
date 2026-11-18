@@ -1,6 +1,6 @@
 // Worker: finds web projects, runs their dev server in a visible Orca terminal,
 // watches the terminal output and answers the panel
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -22,7 +22,9 @@ import {
   type ProjectInfo,
   type WordPressRun
 } from './projects'
-import type { Site, SiteStatus, SitesState } from './protocol'
+import { isWebRuntime, listListeners } from './ports'
+import { buildFixPrompt, DEFAULT_FIX_AGENT, isFixAgent } from './agent'
+import type { Config, PortEntry, PortsState, Site, SiteStatus, SitesState } from './protocol'
 
 const TICK_MS = 1500
 const START_TIMEOUT_MS = 120_000
@@ -37,8 +39,19 @@ const RUNNER: Partial<Record<Kind, string>> = { static: 'python', php: 'php', wo
 const LONG_START_MS = 300_000
 // Playground opens its port while WordPress still boots and answers 502 until it prints this
 const PLAYGROUND_READY = /\bReady!/
+const NOTIFY_GAP_MS = 60_000
+const MAX_LIST = 500
 
-type Workspace = { id: string; name: string; path: string; branch: string | null; hostId: string | null }
+const CONFIG_DEFAULTS: Config = {
+  confirmStart: true,
+  openWhenReady: false,
+  notify: true,
+  readyHint: true,
+  autoStartAfterAgent: false,
+  fixAgent: DEFAULT_FIX_AGENT
+}
+
+type Workspace = { id: string; name: string; path: string; branch: string | null; hostId: string | null; real?: string }
 type Session = {
   terminalId: string
   port: number
@@ -83,6 +96,45 @@ export default function activate(orca: OrcaWorkerApi): void {
   const sessions = new Map<string, Session>()
   let lastSignature = ''
   let timer: ReturnType<typeof setInterval> | undefined
+  // Favorites and hidden projects (stored), projects an agent just finished in (memory)
+  const pinned = new Set<string>()
+  const hidden = new Set<string>()
+  const hints = new Set<string>()
+  const lastNotified = new Map<string, number>()
+  // The workspace the person is in right now (shown on top)
+  let currentId: string | null = null
+
+  async function getConfig(): Promise<Config> {
+    const out = { ...CONFIG_DEFAULTS }
+    for (const key of Object.keys(CONFIG_DEFAULTS) as (keyof Config)[]) {
+      const v = await orca.settings.get(key)
+      if (key === 'fixAgent') {
+        if (isFixAgent(v)) out.fixAgent = v
+      } else if (typeof v === 'boolean') {
+        out[key] = v as never
+      }
+    }
+    return out
+  }
+
+  /** Desktop notification, at most one per project and kind per minute, only if enabled */
+  async function notify(id: string, kind: string, title: string, body: string): Promise<void> {
+    if (!(await getConfig()).notify) return
+    const key = `${id}:${kind}`
+    if (Date.now() - (lastNotified.get(key) ?? 0) < NOTIFY_GAP_MS) return
+    lastNotified.set(key, Date.now())
+    await orca.host.call('notifications.show', { title, body }).catch((e) => orca.log(`notify failed: ${String(e)}`))
+  }
+
+  async function updateStatusBar(): Promise<void> {
+    const active = [...sessions.values()].filter((s) => s.status === 'running')
+    const withErrors = active.some((s) => s.problems.length > 0)
+    const text = active.length ? `${active.length} running` : 'Sites'
+    const tone = withErrors ? 'danger' : active.length ? 'success' : 'neutral'
+    await orca.host
+      .call('statusBar.update', { id: 'sites', text, tone, tooltip: withErrors ? 'A running site shows errors' : 'Local Sites' })
+      .catch(() => undefined)
+  }
 
   const urlOf = (port: number) => `http://localhost:${port}`
 
@@ -98,6 +150,11 @@ export default function activate(orca: OrcaWorkerApi): void {
         branch: ws.branch,
         runner: RUNNER[info.kind] ?? info.manager ?? '',
         framework: info.label,
+        current: ws.id === currentId,
+        pinned: pinned.has(ws.id),
+        hidden: hidden.has(ws.id),
+        needsInstall: info.needsInstall,
+        readyHint: hints.has(ws.id) && !isActive(s),
         status: s?.status ?? 'stopped',
         port: s?.port ?? null,
         url: s && (s.status === 'running' || s.status === 'stopping') ? urlOf(s.port) : null,
@@ -109,7 +166,8 @@ export default function activate(orca: OrcaWorkerApi): void {
         log: s?.log ?? []
       })
     }
-    sites.sort((a, b) => a.name.localeCompare(b.name))
+    // The project you are in first, then favorites, then by name
+    sites.sort((a, b) => Number(b.current) - Number(a.current) || Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name))
     return { sites, updatedAt: Date.now() }
   }
 
@@ -119,8 +177,41 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (force || signature !== lastSignature) {
       lastSignature = signature
       orca.panels.post('sites.changed', state)
+      void updateStatusBar()
     }
     return state
+  }
+
+  type FocusContext = { workspaceId?: string; branch: string; displayName: string; terminals: { id: string }[] } | null
+
+  /** Which workspace is focused. The id comes with the context; if not, name and branch decide, then its terminals. */
+  async function resolveCurrent(ctx: FocusContext): Promise<void> {
+    let id: string | null = null
+    if (ctx) {
+      const branchOf = (b: string | null | undefined) => (b ?? '').replace(/^refs\/heads\//, '')
+      if (ctx.workspaceId && workspaces.some((x) => x.id === ctx.workspaceId)) {
+        id = ctx.workspaceId
+      } else {
+        const candidates = workspaces.filter((x) => x.name === ctx.displayName && branchOf(x.branch) === branchOf(ctx.branch))
+        if (candidates.length === 1) {
+          id = candidates[0].id
+        } else if (candidates.length > 1) {
+          // Several "main" workspaces: the one that owns the focused terminals
+          const focused = new Set(ctx.terminals.map((t) => t.id))
+          for (const c of candidates.slice(0, 20)) {
+            const list = await orca.host.call('terminal.list', { workspaceId: c.id }).catch(() => null)
+            if (list?.terminals.some((t) => focused.has(t.id))) {
+              id = c.id
+              break
+            }
+          }
+        }
+      }
+    }
+    if (id !== currentId) {
+      currentId = id
+      publish(true)
+    }
   }
 
   async function persist(): Promise<void> {
@@ -134,10 +225,12 @@ export default function activate(orca: OrcaWorkerApi): void {
   async function scan(): Promise<void> {
     const res = await orca.host.call('workspace.list')
     // Only workspaces on this machine: the folder is read from the local disk
-    const list = res.workspaces.filter((w) => w.hostId === null || w.hostId === LOCAL_HOST).slice(0, MAX_WORKSPACES)
+    const list: Workspace[] = res.workspaces.filter((w) => w.hostId === null || w.hostId === LOCAL_HOST).slice(0, MAX_WORKSPACES)
     const next = new Map<string, ProjectInfo>()
     await Promise.all(
       list.map(async (w) => {
+        // lsof reports resolved paths (/private/var instead of /var), so keep both
+        w.real = await realpath(w.path).catch(() => w.path)
         const info = await detectProject(w.path)
         if (info) next.set(w.id, info)
         else if (isActive(sessions.get(w.id))) {
@@ -154,7 +247,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     for (const id of sessions.keys()) if (!projects.has(id)) sessions.delete(id)
   }
 
-  const isActive = (s: Session | undefined): s is Session => !!s && (s.status === 'starting' || s.status === 'running' || s.status === 'stopping')
+  const isActive = (s: Session | undefined): boolean => !!s && (s.status === 'starting' || s.status === 'running' || s.status === 'stopping')
 
   async function readTerminal(s: Session): Promise<string[] | null> {
     try {
@@ -169,6 +262,7 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   async function tickSession(s: Session): Promise<void> {
     if (!isActive(s)) return
+    const before = { status: s.status, errors: s.problems.length > 0 }
     const lines = await readTerminal(s)
     if (lines) {
       s.log = lines.slice(-LOG_LINES)
@@ -225,9 +319,24 @@ export default function activate(orca: OrcaWorkerApi): void {
       else if (!lines) [s.status, s.error] = ['stopped', null]
       else if (Date.now() - s.startedAt > s.timeoutMs) [s.status, s.error] = ['error', 'Timed out waiting for the dev server']
     }
+    const id = [...sessions].find(([, session]) => session === s)?.[0]
+    if (id) await notifyChanges(id, s, before, lines !== null)
     if (!isActive(s)) {
       await persist()
-      for (const [id, session] of sessions) if (session === s) await cleanupRunDir(id)
+      for (const [sid, session] of sessions) if (session === s) await cleanupRunDir(sid)
+    }
+  }
+
+  /** Tell the person about a crash, a failed start or new errors, once per minute at most */
+  async function notifyChanges(id: string, s: Session, before: { status: SiteStatus; errors: boolean }, terminalAlive: boolean): Promise<void> {
+    const ws = workspaces.find((x) => x.id === id)
+    const name = ws ? siteLabel(ws.path, ws.name) : 'Project'
+    if (before.status === 'running' && s.status === 'stopped' && terminalAlive) {
+      await notify(id, 'crash', `${name} stopped`, 'The dev server ended unexpectedly. Open the terminal for details.')
+    } else if (before.status === 'starting' && s.status === 'error') {
+      await notify(id, 'fail', `${name} could not start`, s.error ?? 'See the panel for details.')
+    } else if (s.status === 'running' && !before.errors && s.problems.length > 0) {
+      await notify(id, 'errors', `Errors in ${name}`, s.problems[0].slice(0, 140))
     }
   }
 
@@ -292,28 +401,54 @@ export default function activate(orca: OrcaWorkerApi): void {
 
   // Starts run one after another: each one sees the port the previous one took
   let startChain: Promise<unknown> = Promise.resolve()
-  function start(rawId: unknown): Promise<SitesState> {
-    const run = startChain.then(() => doStart(rawId))
+  function start(rawId: unknown, rawPort?: unknown): Promise<SitesState> {
+    const run = startChain.then(() => doStart(rawId, rawPort))
     startChain = run.catch(() => undefined)
     return run
   }
 
-  async function doStart(rawId: unknown): Promise<SitesState> {
-    const id = known(rawId)
-    const info = projects.get(id)!
+  /** A port chosen by the person: an integer in range that nothing uses */
+  async function checkedPort(id: string, raw: unknown): Promise<number> {
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 1024 || raw > 65535) {
+      throw new Error('Port must be a whole number between 1024 and 65535')
+    }
+    const taken = [...sessions].some(([k, s]) => k !== id && isActive(s) && s.port === raw)
+    if (taken || (await isPortOpen(raw))) throw new Error(`Port ${raw} is already in use`)
+    return raw
+  }
+
+  /** Look at the folder again: node_modules may exist by now, or have been removed */
+  async function refreshInfo(id: string): Promise<ProjectInfo> {
     const ws = workspaces.find((w) => w.id === id)!
+    const fresh = await detectProject(ws.path)
+    if (fresh) projects.set(id, fresh)
+    return projects.get(id)!
+  }
+
+  async function doStart(rawId: unknown, rawPort?: unknown): Promise<SitesState> {
+    const id = known(rawId)
+    const ws = workspaces.find((w) => w.id === id)!
+    const info = await refreshInfo(id)
+    hints.delete(id)
     const current = sessions.get(id)
     // Never start twice
     if (isActive(current)) return publish()
     // Close the terminal of the previous run, so they do not pile up (best effort)
     if (current?.terminalId) await orca.host.call('terminal.close', { terminalId: current.terminalId }).catch(() => undefined)
-    const port = await freePort(id)
-    const { terminalId } = await orca.host.call('terminal.create', {
-      workspaceId: ws.id,
-      title: `dev: ${ws.name}`,
-      command: devCommand(info, port, info.kind === 'wordpress' ? await prepareWordPress(id, info, ws.path) : undefined)
-    })
-    sessions.set(id, { terminalId, port, startedAt: Date.now(), status: 'starting', error: null, log: [], history: [], snapshot: [], problems: [], timeoutMs: info.kind === 'wordpress' ? LONG_START_MS : START_TIMEOUT_MS, readyMarker: info.kind === 'wordpress' ? PLAYGROUND_READY : null, warning: null, foreignPort: null })
+    const port = rawPort === undefined ? await freePort(id) : await checkedPort(id, rawPort)
+    let terminalId: string
+    try {
+      ;({ terminalId } = await orca.host.call('terminal.create', {
+        workspaceId: ws.id,
+        title: `dev: ${ws.name}`,
+        command: devCommand(info, port, info.kind === 'wordpress' ? await prepareWordPress(id, info, ws.path) : undefined)
+      }))
+    } catch (err) {
+      // The private temp folder of a failed WordPress start must not stay behind
+      await cleanupRunDir(id)
+      throw err
+    }
+    sessions.set(id, { terminalId, port, startedAt: Date.now(), status: 'starting', error: null, log: [], history: [], snapshot: [], problems: [], timeoutMs: info.kind === 'wordpress' || info.needsInstall ? LONG_START_MS : START_TIMEOUT_MS, readyMarker: info.kind === 'wordpress' ? PLAYGROUND_READY : null, warning: null, foreignPort: null })
     await persist()
     syncTimer()
     return publish(true)
@@ -353,7 +488,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (typeof e.terminalId !== 'string' || !Number.isInteger(e.port) || !projects.has(id)) continue
       const port = e.port as number
       if (port < 1024 || port > 65535 || !(await isPortOpen(port))) continue
-      const session: Session = { terminalId: e.terminalId, port, startedAt: Date.now(), status: 'running', error: null, log: [], history: [], snapshot: [], problems: [], timeoutMs: START_TIMEOUT_MS }
+      const session: Session = { terminalId: e.terminalId, port, startedAt: Date.now(), status: 'running', error: null, log: [], history: [], snapshot: [], problems: [], timeoutMs: START_TIMEOUT_MS, readyMarker: null, warning: null, foreignPort: null }
       // The terminal must still exist, else a foreign server on that port would look like ours
       if (!(await readTerminal(session))) continue
       sessions.set(id, session)
@@ -361,6 +496,16 @@ export default function activate(orca: OrcaWorkerApi): void {
   }
 
   const ready = scan()
+    .then(async () => {
+      await resolveCurrent(await orca.host.call('workspace.readContext').catch(() => null))
+    })
+    .then(async () => {
+      for (const key of ['pinned', 'hidden'] as const) {
+        const saved = await orca.storage.get(key)
+        const target = key === 'pinned' ? pinned : hidden
+        if (Array.isArray(saved)) for (const v of saved.slice(0, MAX_LIST)) if (typeof v === 'string') target.add(v)
+      }
+    })
     .then(restore)
     .then(() => {
       publish(true)
@@ -377,13 +522,181 @@ export default function activate(orca: OrcaWorkerApi): void {
     await tick()
     return publish(true)
   })
-  orca.panels.handle('site.start', async ({ id }) => start(id))
+  // What a start would run, for the confirmation in the panel (nothing is written or started)
+  orca.panels.handle('site.plan', async ({ id }) => {
+    const known_ = known(id)
+    // Same view as the start will have, so the confirmation shows what really runs
+    const info = await refreshInfo(known_)
+    const ws = workspaces.find((w) => w.id === known_)!
+    const port = await freePort(known_)
+    // WordPress runs from a private temp folder that is created at the start, its name here is a placeholder
+    const preview: WordPressRun | undefined =
+      info.kind === 'wordpress' ? { workDir: '/tmp/orca-local-sites-xxxxxx', project: ws.path } : undefined
+    return { command: devCommand(info, port, preview), port }
+  })
+  orca.panels.handle('site.start', async ({ id, port }) => start(id, port))
+
+  /** Listening ports of servers that belong to Orca: started here, or web runtimes in a listed project */
+  async function scanPorts(): Promise<PortsState> {
+    const listeners = await listListeners()
+    const ours = new Set([...sessions.values()].filter(isActive).map((s) => s.port))
+    // The workspace with the deepest folder around the program owns it. Only if that one has a row
+    // in the list the port counts, so a parent folder (or a workspace that is no project) never claims what runs below.
+    const owner = (cwd: string | null): Workspace | null => {
+      if (!cwd) return null
+      let best: Workspace | null = null
+      let bestLength = -1
+      for (const w of workspaces) {
+        for (const root of [w.path, w.real]) {
+          if (root && (cwd === root || cwd.startsWith(`${root}/`)) && root.length > bestLength) {
+            best = w
+            bestLength = root.length
+          }
+        }
+      }
+      return best && projects.has(best.id) ? best : null
+    }
+    const ports: PortEntry[] = (listeners ?? [])
+      .map((l) => {
+        const ws = owner(l.cwd)
+        return { port: l.port, pid: l.pid, process: l.process, project: ws ? siteLabel(ws.path, ws.name) : null, projectId: ws?.id ?? null, ours: ours.has(l.port) }
+      })
+      // Only what belongs to Orca: servers started here, or web runtimes running in the folder of a listed project
+      .filter((l) => l.port >= 1024 && (l.ours || (l.projectId && isWebRuntime(l.process))))
+    return { ports, unavailable: listeners === null }
+  }
+
+  let portsCache: { at: number; state: PortsState } | null = null
+  orca.panels.handle('ports.get', async () => {
+    // lsof is cheap, but several open panels should not run it at the same time
+    if (portsCache && Date.now() - portsCache.at < 1500) return portsCache.state
+    const state = await scanPorts()
+    portsCache = { at: Date.now(), state }
+    return state
+  })
+
+  // Ends a dev server that runs in a project folder but was not started by this plugin (SIGTERM only)
+  orca.panels.handle('site.stopExternal', async ({ id, pid, port }) => {
+    const siteId = known(id)
+    if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid || !Number.isInteger(port)) throw new Error('Invalid process')
+    // Look again right now: the process must still be the same one, on that port, in that project, and a web runtime
+    portsCache = null
+    const fresh = await scanPorts()
+    const match = fresh.ports.find((x) => x.pid === pid && x.port === port && x.projectId === siteId && !x.ours)
+    if (!match) throw new Error('This server is no longer running in the project. Refresh the list.')
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch (e) {
+      throw new Error(`Could not stop the process: ${e instanceof Error ? e.message : 'unknown error'}`)
+    }
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 200))
+      if (!(await isPortOpen(port))) break
+    }
+    portsCache = null
+    if (await isPortOpen(port)) throw new Error(`The process (PID ${pid}) did not end. Close it by hand.`)
+    return { ok: true as const }
+  })
+
+  orca.panels.handle('config.get', async () => getConfig())
+  orca.panels.handle('config.set', async (input) => {
+    if (!input || typeof input !== 'object') throw new Error('Invalid settings')
+    for (const [key, value] of Object.entries(input)) {
+      if (!Object.hasOwn(CONFIG_DEFAULTS, key)) throw new Error(`Unknown setting: ${key}`)
+      if (key === 'fixAgent' ? !isFixAgent(value) : typeof value !== 'boolean') throw new Error(`Invalid value for ${key}`)
+      await orca.settings.set(key, value as string | boolean)
+    }
+    return getConfig()
+  })
+
   orca.panels.handle('site.stop', async ({ id }) => stop(id))
   orca.panels.handle('site.show', async ({ id }) => {
     const s = sessions.get(known(id))
     if (!s?.terminalId) throw new Error('No terminal yet. Start the project first.')
     await orca.host.call('terminal.focus', { terminalId: s.terminalId })
     return { ok: true as const }
+  })
+
+  // "Fix with agent": starts an agent in the project's workspace with the errors as its task
+  orca.panels.handle('site.fix', async ({ id }) => {
+    const siteId = known(id)
+    const s = sessions.get(siteId)
+    if (!s || s.problems.length === 0) throw new Error('There are no errors to fix.')
+    const ws = workspaces.find((x) => x.id === siteId)!
+    const agent = (await getConfig()).fixAgent
+    await orca.host.call('agent.launch', {
+      workspaceId: siteId,
+      agent: isFixAgent(agent) ? agent : DEFAULT_FIX_AGENT,
+      prompt: buildFixPrompt(siteLabel(ws.path, ws.name), projects.get(siteId)!.label, s.problems)
+    })
+    return { ok: true as const }
+  })
+
+  async function saveList(key: 'pinned' | 'hidden', set: Set<string>): Promise<void> {
+    await orca.storage.set(key, [...set].slice(-MAX_LIST))
+  }
+  orca.panels.handle('site.pin', async ({ id, pinned: value }) => {
+    const siteId = known(id)
+    if (typeof value !== 'boolean') throw new Error('Invalid value')
+    if (value) pinned.add(siteId)
+    else pinned.delete(siteId)
+    await saveList('pinned', pinned)
+    return publish(true)
+  })
+  orca.panels.handle('site.hide', async ({ id, hidden: value }) => {
+    const siteId = known(id)
+    if (typeof value !== 'boolean') throw new Error('Invalid value')
+    if (value) hidden.add(siteId)
+    else hidden.delete(siteId)
+    await saveList('hidden', hidden)
+    return publish(true)
+  })
+  orca.panels.handle('site.dismissHint', async ({ id }) => {
+    hints.delete(known(id))
+    return publish(true)
+  })
+
+  // An agent finished in a project that is not running: hint, notification, or start it right away
+  orca.events.on('workspace.changed', async (e) => {
+    await ready
+    await resolveCurrent(e.context)
+  })
+
+  let lastRescan = 0
+  orca.events.on('agent.status.changed', async (e) => {
+    const id = e.workspaceId
+    if (!id) return
+    // A worktree an agent created after the last scan is not known yet: look again, at most every 5 seconds
+    if (!projects.has(id) && Date.now() - lastRescan > 5000) {
+      lastRescan = Date.now()
+      await scan().catch((err) => orca.log(`rescan failed: ${String(err)}`))
+      publish()
+    }
+    if (!projects.has(id)) return
+    if (e.state === 'working') {
+      if (hints.delete(id)) publish(true)
+      return
+    }
+    if (e.state !== 'done' || isActive(sessions.get(id))) return
+    // A failed or cancelled run is no reason to start the server by itself
+    const outcome = e.mainAgent?.outcome
+    const succeeded = !outcome || outcome === 'success'
+    const cfg = await getConfig()
+    const ws = workspaces.find((x) => x.id === id)
+    const name = ws ? siteLabel(ws.path, ws.name) : 'Project'
+    // A server that already runs by hand in this project must not get a second one
+    const runsOutside = (await scanPorts()).ports.some((x) => x.projectId === id && !x.ours)
+    if (cfg.autoStartAfterAgent && succeeded && !runsOutside) {
+      const started = await start(id).then(() => true, (err) => {
+        orca.log(`auto start failed: ${String(err)}`)
+        return false
+      })
+      if (started) await notify(id, 'ready', `${name} is starting`, 'An agent finished, the dev server starts.')
+    } else if (cfg.readyHint && !runsOutside) {
+      hints.add(id)
+      publish(true)
+      await notify(id, 'ready', `${name} is ready to view`, 'An agent finished. Start the dev server in the Local Sites panel.')
+    }
   })
 
   orca.commands.register('refresh', async () => {

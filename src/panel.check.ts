@@ -2,7 +2,7 @@
 import { defineCheck } from 'orca/testing'
 import type { SitesState } from './protocol'
 
-const base = { error: null, warning: null, foreignUrl: null, hasErrors: false, problems: [] as string[], log: [] as string[], port: null, url: null }
+const base = { current: false, error: null, warning: null, foreignUrl: null, pinned: false, hidden: false, needsInstall: false, readyHint: false, hasErrors: false, problems: [] as string[], log: [] as string[], port: null, url: null }
 
 const state: SitesState = {
   updatedAt: Date.now(),
@@ -11,6 +11,8 @@ const state: SitesState = {
       ...base,
       id: 'w1',
       name: 'acme-shop',
+      pinned: true,
+      current: true,
       branch: 'main',
       runner: 'pnpm',
       framework: 'Next.js',
@@ -21,7 +23,7 @@ const state: SitesState = {
       problems: ['⨯ Failed to compile', './app/page.tsx', "Module not found: Can't resolve './hero'"],
       log: ['  ▲ Next.js 16.0.0', '  - Local: http://localhost:3201', ' ✓ Ready in 1.2s', ' ⨯ Failed to compile', './app/page.tsx: Module not found']
     },
-    { ...base, id: 'w2', name: 'acme-landing', branch: 'main', runner: 'npm', framework: 'Astro', status: 'stopped' },
+    { ...base, id: 'w2', name: 'acme-landing', branch: 'main', runner: 'npm', framework: 'Astro', status: 'stopped', needsInstall: true, readyHint: true },
     {
       ...base,
       id: 'w3',
@@ -37,7 +39,17 @@ const state: SitesState = {
   ]
 }
 
+const config = { confirmStart: true, openWhenReady: false, notify: true, readyHint: true, autoStartAfterAgent: false, fixAgent: 'claude' }
+
+const demoPorts = {
+  unavailable: false,
+  ports: [
+    { port: 3201, pid: 4177, process: 'node', project: 'acme-shop', projectId: 'w1', ours: true },
+    { port: 3300, pid: 4230, process: 'node', project: 'acme-docs', projectId: 'w3', ours: false }
+  ]
+}
+
 export default defineCheck({
-  list: { requests: { 'sites.get': state } },
-  empty: { requests: { 'sites.get': { sites: [], updatedAt: Date.now() } } }
+  list: { requests: { 'sites.get': state, 'ports.get': demoPorts, 'config.get': config } },
+  empty: { requests: { 'sites.get': { sites: [], updatedAt: Date.now() }, 'ports.get': { ports: [], unavailable: false }, 'config.get': config } }
 })

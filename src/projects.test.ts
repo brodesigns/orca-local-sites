@@ -14,10 +14,11 @@ async function detect(deps: Record<string, string>, scripts: Record<string, stri
   return detectProject(await project({ 'package.json': JSON.stringify({ dependencies: deps, scripts }), ...extra }))
 }
 
-const base: ProjectInfo = { kind: 'node', manager: 'pnpm', framework: 'next', label: 'Next.js', script: 'dev', port: 'env', docroot: '.', plugins: [] }
+const base: ProjectInfo = { kind: 'node', manager: 'pnpm', framework: 'next', label: 'Next.js', script: 'dev', port: 'env', docroot: '.', plugins: [], needsInstall: false }
 
 test('detects the framework, script and package manager', async () => {
-  assert.deepEqual(await detect({ next: '16' }, { dev: 'next dev' }, { 'pnpm-lock.yaml': '' }), base)
+  // a fresh worktree has no node_modules
+  assert.deepEqual(await detect({ next: '16' }, { dev: 'next dev' }, { 'pnpm-lock.yaml': '' }), { ...base, needsInstall: true })
   assert.equal((await detect({ astro: '5' }, { dev: 'astro dev' }, { 'yarn.lock': '' }))?.label, 'Astro')
   assert.equal((await detect({ nuxt: '3' }, { dev: 'nuxt dev' }))?.label, 'Nuxt')
   assert.equal((await detect({ '@sveltejs/kit': '2', vite: '5' }, { dev: 'vite dev' }))?.label, 'SvelteKit')
@@ -49,6 +50,21 @@ test('detects WordPress plugins and themes before anything else', async () => {
     })
   )
   assert.equal(withVite?.kind, 'wordpress')
+})
+
+test('install first when node_modules is missing', async () => {
+  const dir = await project({ 'package.json': JSON.stringify({ dependencies: { next: '16' }, scripts: { dev: 'next dev' } }), 'pnpm-lock.yaml': '' })
+  assert.equal((await detectProject(dir))?.needsInstall, true)
+  await mkdir(join(dir, 'node_modules'))
+  assert.equal((await detectProject(dir))?.needsInstall, false)
+  assert.equal(devCommand({ ...base, needsInstall: true }, 3201), 'pnpm install && PORT=3201 pnpm dev')
+  assert.equal(devCommand({ ...base, needsInstall: true, manager: 'npm', port: '--port' }, 3201), 'npm install && npm run dev -- --port 3201')
+  assert.equal(devCommand({ ...base, needsInstall: true, manager: 'yarn' }, 3201), 'yarn install && PORT=3201 yarn dev')
+})
+
+test('Yarn Plug\'n\'Play counts as installed', async () => {
+  const pkg = JSON.stringify({ dependencies: { next: '16' }, scripts: { dev: 'next dev' } })
+  assert.equal((await detectProject(await project({ 'package.json': pkg, 'yarn.lock': '', '.pnp.cjs': '' })))?.needsInstall, false)
 })
 
 test('detects PHP and static sites', async () => {
@@ -165,7 +181,7 @@ test('WordPress: plugins the project needs go into a blueprint', async () => {
   const code = '<?php\n/* Plugin Name: Shop */\n' + '// x\n'.repeat(3000) + "add_filter('woocommerce_locate_template', 'x');"
   assert.deepEqual((await detectProject(await project({ 'shop.php': code })))?.plugins, ['woocommerce'])
   assert.deepEqual((await detectProject(await project({ 'plain.php': '<?php\n/* Plugin Name: Plain */' })))?.plugins, [])
-  const wp = { ...base, kind: 'wordpress', manager: null, script: null, port: null, plugins: ['woocommerce'] } as const
+  const wp: ProjectInfo = { ...base, kind: 'wordpress', manager: null, script: null, port: null, plugins: ['woocommerce'] }
   const run = { workDir: '/var/tmp/orca-local-sites-aB1', project: '/Users/me/My Plugins/shop', blueprint: '/var/tmp/orca-local-sites-aB1/blueprint.json' }
   assert.equal(
     devCommand(wp, 3201, run),
